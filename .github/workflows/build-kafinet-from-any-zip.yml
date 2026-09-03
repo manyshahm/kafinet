@@ -1,0 +1,307 @@
+name: Kafinet - Build Latest Uploaded ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+      - '*.ZIP'
+      - '**/*.ZIP'
+      - '.github/workflows/build-kafinet-from-any-zip.yml'
+
+env:
+  FLUTTER_VERSION: '3.38.7'
+  JAVA_VERSION: '17'
+  EXPECTED_PACKAGE: 'ir.miplus.kafinet'
+  EXPECTED_KEY_ALIAS: 'gamino_release'
+  EXPECTED_KEYSTORE_SHA256: '4498395d237db683265e384e590dc07580d5d76918d5ea0351cb0d09dd5da312'
+  EXPECTED_CERT_SHA256_NORMALIZED: '937a45cb0c47b3f620a179c1d1829889bff1229f925bc4d099407b287e8766b6'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select ZIP to build
+        id: source_zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t ALL_ZIPS < <(git ls-files | grep -Ei '\.zip$' | grep -Ev '^(build|dist)/' | sort)
+          if [ "${#ALL_ZIPS[@]}" -eq 0 ]; then
+            echo "No tracked ZIP file found in repository."
+            exit 1
+          fi
+
+          SELECTED=""
+
+          # On push, prefer a ZIP added/modified in this push.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              mapfile -t CHANGED_ZIPS < <(
+                git diff --name-only --diff-filter=AM "$BEFORE" "$AFTER" | grep -Ei '\.zip$' | sort
+              )
+            else
+              mapfile -t CHANGED_ZIPS < <(
+                git show --pretty='' --name-only --diff-filter=AM "$AFTER" | grep -Ei '\.zip$' | sort
+              )
+            fi
+
+            if [ "${#CHANGED_ZIPS[@]}" -gt 0 ]; then
+              SELECTED="${CHANGED_ZIPS[$((${#CHANGED_ZIPS[@]} - 1))]}"
+            fi
+          fi
+
+          # Manual run / workflow-only change: choose the ZIP with the newest Git commit timestamp.
+          if [ -z "$SELECTED" ]; then
+            BEST_TS=-1
+            for z in "${ALL_ZIPS[@]}"; do
+              TS="$(git log -1 --format=%ct -- "$z" || true)"
+              TS="${TS:-0}"
+              if [ "$TS" -ge "$BEST_TS" ]; then
+                BEST_TS="$TS"
+                SELECTED="$z"
+              fi
+            done
+          fi
+
+          test -n "$SELECTED"
+          test -s "$SELECTED"
+          echo "Selected source ZIP: $SELECTED"
+          echo "zip_path=$SELECTED" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP and detect Flutter project root
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/kafinet-source"
+          mkdir -p "$RUNNER_TEMP/kafinet-source"
+          unzip -q "${{ steps.source_zip.outputs.zip_path }}" -d "$RUNNER_TEMP/kafinet-source"
+
+          PROJECT_DIR="$(python3 - <<'PY'
+          from pathlib import Path
+          root = Path(__import__('os').environ['RUNNER_TEMP']) / 'kafinet-source'
+          candidates = []
+          for pubspec in root.rglob('pubspec.yaml'):
+              p = pubspec.parent
+              if (p / 'lib' / 'main.dart').is_file():
+                  text = pubspec.read_text(encoding='utf-8', errors='ignore')
+                  if 'flutter:' in text:
+                      candidates.append(p)
+          if not candidates:
+              raise SystemExit('No Flutter project containing pubspec.yaml and lib/main.dart was found inside ZIP.')
+          candidates.sort(key=lambda p: (len(p.parts), str(p)))
+          print(candidates[0])
+          PY
+          )"
+
+          test -f "$PROJECT_DIR/pubspec.yaml"
+          test -f "$PROJECT_DIR/lib/main.dart"
+          echo "Detected Flutter project: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Verify Gamino signing material
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          test -s build_support/gamino-release-key.jks
+          test -s build_support/key.properties
+
+          ACTUAL_SHA256="$(sha256sum build_support/gamino-release-key.jks | awk '{print $1}')"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_KEYSTORE_SHA256" ]; then
+            echo "Unexpected keystore SHA256: $ACTUAL_SHA256"
+            exit 1
+          fi
+
+          grep -q "^keyAlias=${EXPECTED_KEY_ALIAS}$" build_support/key.properties
+          echo "Gamino keystore and alias verified."
+
+      - name: Generate Android project and configure signed Release
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          rm -rf android "$RUNNER_TEMP/kafinet-android-template"
+
+          flutter create \
+            --platforms=android \
+            --org ir.miplus \
+            --project-name kafinet \
+            "$RUNNER_TEMP/kafinet-android-template"
+
+          cp -a "$RUNNER_TEMP/kafinet-android-template/android" ./android
+          cp build_support/gamino-release-key.jks android/app/gamino-release-key.jks
+          cp build_support/key.properties android/key.properties
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text(encoding='utf-8')
+          text = re.sub(r'android:label="[^"]*"', 'android:label="کافی‌نت چشمه"', text, count=1)
+          if 'android.permission.INTERNET' not in text:
+              text = text.replace(
+                  '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                  '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                  '    <uses-permission android:name="android.permission.INTERNET" />'
+              )
+          manifest.write_text(text, encoding='utf-8')
+
+          gradle = Path('android/app/build.gradle.kts')
+          s = gradle.read_text(encoding='utf-8')
+
+          if 'import java.util.Properties' not in s:
+              s = 'import java.io.FileInputStream\nimport java.util.Properties\n\n' + s
+
+          props = '''
+          val keystoreProperties = Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          check(keystorePropertiesFile.exists()) { "Missing android/key.properties" }
+          keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+
+          '''
+          if 'val keystoreProperties = Properties()' not in s:
+              marker = '\nandroid {'
+              if marker not in s:
+                  raise SystemExit('Could not locate android block in build.gradle.kts')
+              s = s.replace(marker, '\n' + props + 'android {', 1)
+
+          signing = '''
+              signingConfigs {
+                  create("release") {
+                      keyAlias = keystoreProperties["keyAlias"] as String
+                      keyPassword = keystoreProperties["keyPassword"] as String
+                      storeFile = file(keystoreProperties["storeFile"] as String)
+                      storePassword = keystoreProperties["storePassword"] as String
+                  }
+              }
+          '''
+          if 'create("release")' not in s:
+              s = s.replace('android {', 'android {' + signing, 1)
+
+          s, count = re.subn(
+              r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)',
+              'signingConfig = signingConfigs.getByName("release")',
+              s,
+              count=1,
+          )
+          if count != 1 and 'signingConfig = signingConfigs.getByName("release")' not in s:
+              raise SystemExit('Could not configure Release signing.')
+
+          expected = 'ir.miplus.kafinet'
+          if f'applicationId = "{expected}"' not in s:
+              raise SystemExit('Generated applicationId does not match ir.miplus.kafinet')
+          if f'namespace = "{expected}"' not in s:
+              raise SystemExit('Generated namespace does not match ir.miplus.kafinet')
+
+          gradle.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Install dependencies
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Static analysis
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: flutter analyze
+
+      - name: Tests
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: flutter test
+
+      - name: Build signed APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: flutter build apk --release
+
+      - name: Build signed AAB
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: flutter build appbundle --release
+
+      - name: Verify APK package and signing certificate
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK='build/app/outputs/flutter-apk/app-release.apk'
+          test -s "$APK"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK_ROOT"
+          AAPT="$(find "$SDK_ROOT/build-tools" -type f \( -name aapt -o -name aapt2 \) | sort -V | tail -n1)"
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+
+          BADGING="$($AAPT dump badging "$APK" 2>/dev/null || true)"
+          printf '%s\n' "$BADGING" | grep -q "package: name='$EXPECTED_PACKAGE'"
+
+          CERT_OUT="$($APKSIGNER verify --print-certs "$APK")"
+          NORMALIZED_CERT_OUT="$(printf '%s' "$CERT_OUT" | tr '[:upper:]' '[:lower:]' | tr -d ':')"
+          printf '%s' "$NORMALIZED_CERT_OUT" | grep -Fq "$EXPECTED_CERT_SHA256_NORMALIZED"
+
+          echo "APK package and Gamino signing certificate verified."
+
+      - name: Package build outputs
+        id: package
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          VERSION="$(awk '/^version:/ {print $2; exit}' pubspec.yaml | tr -d '\r')"
+          VERSION_NAME="${VERSION%%+*}"
+          [ -n "$VERSION_NAME" ] || VERSION_NAME='unknown'
+
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/Kafinet_Cheshmeh_v${VERSION_NAME}.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "dist/Kafinet_Cheshmeh_v${VERSION_NAME}.aab"
+          sha256sum dist/*.apk dist/*.aab > dist/SHA256SUMS.txt
+
+          {
+            echo "Source ZIP: ${{ steps.source_zip.outputs.zip_path }}"
+            echo "Package: $EXPECTED_PACKAGE"
+            echo "Version: $VERSION"
+            echo "Signing alias: $EXPECTED_KEY_ALIAS"
+            echo "Keystore SHA256: $EXPECTED_KEYSTORE_SHA256"
+            echo "Certificate SHA256: 93:7A:45:CB:0C:47:B3:F6:20:A1:79:C1:D1:82:98:89:BF:F1:22:9F:92:5B:C4:D0:99:40:7B:28:7E:87:66:B6"
+          } > dist/BUILD_INFO.txt
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK and AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafinet-cheshmeh-${{ steps.package.outputs.version_name }}-signed
+          path: ${{ steps.project.outputs.project_dir }}/dist/*
+          if-no-files-found: error
+          retention-days: 30
